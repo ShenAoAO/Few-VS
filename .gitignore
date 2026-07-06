@@ -1,0 +1,40 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# Large/generated experiment assets
+outputs/
+output/
+results/
+logs/
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.pkl
+*.lmdb-lock
+
+# Archives and datasets that should be shared separately
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+data/
+embeddings/
