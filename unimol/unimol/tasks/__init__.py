@@ -7,6 +7,6 @@ import importlib
 #         importlib.import_module("unimol.tasks." + file.name[:-3])
 # importlib.import_module("unimol.tasks.drugfewshot_cross")
 # importlib.import_module("unimol.tasks.drugfewshot_layerad")
-# importlib.import_module("unimol.tasks.drugfewshot_adapter")
-importlib.import_module("unimol.tasks.drugclip")
+importlib.import_module("unimol.tasks.drugfewshot_adpater")
+# importlib.import_module("unimol.tasks.drugclip")
 # importlib.import_module("unimol.tasks.drugclipcross")

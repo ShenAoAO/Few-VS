@@ -90,11 +90,6 @@ class TransformerEncoderWithPair(nn.Module):
                 nn.Linear(64, self.embed_dim)
             ) for _ in range(total_d_layer)
         ])
-        # self.adapters = nn.ModuleList([
-        #     nn.Sequential(
-        #         nn.Linear(self.embed_dim, 1)
-        #     ) for _ in range(total_d_layer)
-        # ])
         # self.fixed_adapter_tokens = nn.ParameterList([
         #     nn.Parameter(torch.zeros(1, self.prompt_tokens, self.embed_dim))  # shape: [1, prompt_tokens, embed_dim]
         #     for _ in range(len(self.layers))
@@ -113,6 +108,73 @@ class TransformerEncoderWithPair(nn.Module):
         nn.init.uniform_(self.deep_prompt_embeddings, -val, val)
         # self.prompt_weight = nn.Parameter(torch.tensor(1.0))
         # self.gate_weight = nn.Parameter(torch.tensor(1.0))
+
+        # ------------------------------------------------------------------
+        # `tmi_gate_mode` (set by the `fewshot` model from `--tmi-gate-mode`)
+        #
+        # `legacy`: prompt = prompt_embed * adapters(fine_feat).
+        #              With the default initialisations |prompt| ~ 2e-3 while the
+        #              real atom/residue tokens have |x| ~ 22.6, i.e. the prompt
+        #              positions are numerically zero vectors and the TMI feature
+        #              has *no* influence on the output (verified with
+        #              `script/tmi_sensitivity_check.py`: zeroing fine_feat leaves
+        #              the embeddings bit-identical).  Kept for reproducibility.
+        # `residual` : gate = adapters(LayerNorm(fine_feat)) used as a *modulation
+        #              around 1*, and the prompt tokens are LayerNorm-ed so that
+        #              their scale (~sqrt(D) = 22.6) matches the real tokens.
+        #              This is what makes the TMI variants actually distinguishable.
+        # ------------------------------------------------------------------
+        self.tmi_gate_mode = "legacy"
+        self.prompt_gate_norm = LayerNorm(self.embed_dim)
+        self.prompt_out_norm = LayerNorm(self.embed_dim)
+        # per-layer injection strength for `gated`; zero-init => identity w.r.t.
+        # the published `legacy` configuration
+        self.tmi_alpha = nn.Parameter(torch.zeros(total_d_layer))
+        # ------------------------------------------------------------------
+        # Bounding / restricting the `gated` injection.
+        #
+        # The raw `alpha_t * LayerNorm(fine_feat)` term is unbounded and lives at
+        # token scale (~sqrt(D) = 22.6) while `prompt_embed * gate` is~2e-3.  A
+        # few tens of SGD steps on 2-16 support molecules are enough for alpha_t
+        # to overshoot, which replaces the (numerically zero) prompt positions by
+        # full-scale artificial tokens in *every* layer and destroys the frozen
+        # encoder's geometry -- empirically the loss w.r.t. `legacy` grows with
+        # the number of support updates (-0.16 AUROC at 2-shot, -1.92 at 16-shot).
+        #
+        # `tmi_alpha_beta`      : hard bound, effective strength = beta*tanh(alpha)
+        #                         so |strength| < beta regardless of overshoot.
+        #                         beta=1 reproduces the unbounded behaviour for
+        #                         small alpha (tanh(a) ~ a), hence it is the
+        #                         backward-compatible default.
+        # `tmi_inject_layers`   : inject only in the last k layers (-1 = all).
+        #                         Shallow injection corrupts the whole geometric
+        #                         encoding chain; deep-only injection edits the
+        #                         semantics alone.
+        # ------------------------------------------------------------------
+        self.tmi_alpha_beta = 1.0
+        self.tmi_inject_layers = -1
+
+    def _tmi_injection_scale(self, i):
+        """Effective (bounded) injection strength of layer `i`, or None if this
+        layer must not receive any TMI injection."""
+        n_layers = len(self.layers)
+        k = self.tmi_inject_layers
+        if k is not None and k >= 0 and i < n_layers - k:
+            return None
+        return self.tmi_alpha_beta * torch.tanh(self.tmi_alpha[i])
+
+    def tmi_injection_strengths(self):
+        """Per-layer effective injection strengths (detached, for diagnostics)."""
+        with torch.no_grad():
+            n_layers = len(self.layers)
+            k = self.tmi_inject_layers
+            s = self.tmi_alpha_beta * torch.tanh(self.tmi_alpha.detach().float())
+            if k is not None and k >= 0:
+                mask = torch.zeros_like(s)
+                if k > 0:
+                    mask[max(n_layers - k, 0):] = 1.0
+                s = s * mask
+            return s.cpu()
 
     def forward(
         self,
@@ -179,11 +241,61 @@ class TransformerEncoderWithPair(nn.Module):
                 # else:
                 #     prompt_input = self.fixed_adapter_tokens[i].expand(bsz, -1, -1)
                 # if i==0:
-                gate = self.adapters[i](fine_feat).unsqueeze(1)
-                # gate = fine_feat.unsqueeze(1)
-                prompt_embed = self.prompt_proj(self.deep_prompt_embeddings[i]).expand(bsz, -1, -1)
-                prompt_input = self.prompt_dropout(prompt_embed*gate
-                                                    )
+                if self.tmi_gate_mode == "none":
+                    # ablation of the paper ("we remove the TMI module ... the model
+                    # simply inserts randomly initialised prompt tokens"): the prompt
+                    # tokens are used WITHOUT the gate, i.e. |prompt| ~ 1.4 instead of
+                    # ~2e-3, which is why that ablation is noisy -- the gate was in
+                    # fact switching the prompts OFF, not injecting interaction info.
+                    prompt_embed = self.prompt_proj(
+                        self.deep_prompt_embeddings[i]).expand(bsz, -1, -1)
+                    prompt_input = self.prompt_dropout(prompt_embed)
+                elif self.tmi_gate_mode == "legacy":
+                    gate = self.adapters[i](fine_feat).unsqueeze(1)
+                    prompt_embed = self.prompt_proj(
+                        self.deep_prompt_embeddings[i]).expand(bsz, -1, -1)
+                    prompt_input = self.prompt_dropout(prompt_embed * gate)
+                elif self.tmi_gate_mode == "gated":
+                    # Identity-initialised gated residual injection.
+                    #prompt = prompt_embed * adapters(fine_feat)            <- legacy
+                    #+ beta*tanh(alpha_t) * LayerNorm(fine_feat) <- new
+                    # `alpha_t` starts at 0, so at initialisation this branch is
+                    # BIT-IDENTICAL to `legacy` (the published configuration), while
+                    # d L / d alpha_t = <d L / d prompt, LayerNorm(fine_feat)> is at
+                    # token scale and is NOT damped by the ~3e-3 gate, so the support
+                    # set can actually learn whether/how much to use the interaction.
+                    # `beta*tanh(.)` bounds that strength and `tmi_inject_layers`
+                    # restricts it to the deepest layers (see __init__).
+                    gate = self.adapters[i](fine_feat).unsqueeze(1)
+                    prompt_embed = self.prompt_proj(
+                        self.deep_prompt_embeddings[i]).expand(bsz, -1, -1)
+                    prompt_input = prompt_embed * gate
+                    alpha = self._tmi_injection_scale(i)
+                    if alpha is not None:
+                        prompt_input = prompt_input + alpha * self.prompt_gate_norm(
+                            fine_feat).unsqueeze(1)
+                    prompt_input = self.prompt_dropout(prompt_input)
+                else:
+                    # normalise the TMI feature (it is an element-wise product of
+                    # two hidden states, so its scale/mean are arbitrary), use the
+                    # gate as a modulation around 1, and bring the prompt tokens to
+                    # the same scale as the real tokens.
+                    feat = self.prompt_gate_norm(fine_feat)
+                    gate = self.adapters[i](feat).unsqueeze(1)
+                    prompt_embed = self.prompt_proj(
+                        self.deep_prompt_embeddings[i]).expand(bsz, -1, -1)
+                    prompt_input = prompt_embed * (1.0 + gate)
+                    if self.tmi_gate_mode == "inject":
+                        # `adapters` are randomly initialised (they are absent from
+                        # the DrugCLIP checkpoint) so `gate` is a small random
+                        # perturbation and the TMI content would still not reach the
+                        # encoder.  Add the normalised interaction feature directly
+                        # to the prompt tokens instead: the injected content is
+                        # TMI-dependent by construction, no pre-training needed.
+                        prompt_input = prompt_input + feat.unsqueeze(1)
+                    prompt_input = self.prompt_dropout(
+                        self.prompt_out_norm(prompt_input)
+                    )
                 # [bsz, prompt_tokens, embed_dim]
 
                 x = torch.cat((
